@@ -1,22 +1,21 @@
 """
-DỰ ÁN 8 — TRỢ LÝ NHIỀU PDF (RAG + Gradio)
-==========================================
+Multi-PDF Assistant (RAG + Gradio)
 
-Nạp 2–3 tài liệu PDF *cùng chủ đề*, hỏi một câu và trợ lý sẽ:
-1. Tìm các trang liên quan trong TẤT CẢ tài liệu.
-2. Viết câu trả lời dựa trên các trang đó.
-3. Cho biết NGUỒN NÀO (tên file + số trang) đề cập vấn đề đó.
+Upload 2-3 PDF documents on the same topic, ask a question, and the
+assistant will:
+1. Find the relevant pages across ALL documents.
+2. Write an answer based on those pages.
+3. State which source (file name + page number) covers that topic.
 
-Cách chạy (local):
+Run locally:
     pip install -r requirements.txt
-    python app.py
-    -> mở đường link http://127.0.0.1:7860 hiện ra trong terminal
+    python app_v2.py
+    -> open the http://127.0.0.1:7860 link printed in the terminal
 
-Muốn có link công khai tạm thời (để demo/chia sẻ), đổi dòng cuối file
-thành demo.launch(share=True).
+For a temporary public link (e.g. for a demo), change the last line to
+demo.launch(share=True).
 
-Nên chạy trên máy/Colab có GPU cho nhanh; không có GPU vẫn chạy được,
-chỉ chậm hơn.
+Works without a GPU too, just slower at the answer-generation step.
 """
 
 import os
@@ -28,272 +27,267 @@ from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 
+# PART 1 - LOAD THE AI MODELS
+print("Loading AI models... (first run can take 2-3 minutes)")
 
-# ============================================================
-# PHẦN 1 — NẠP CÁC MÔ HÌNH AI
-# ============================================================
-print("⏳ Đang tải AI... (lần đầu có thể mất 2–3 phút)")
-
-# Bộ não 1 — AI TÌM KIẾM: biến chữ thành embedding để tìm trang liên quan
-ai_tim_kiem = SentenceTransformer(
+# Retriever: turns text into embeddings to find relevant pages
+retriever_model = SentenceTransformer(
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
 
-# Bộ não 2 — AI TRẢ LỜI: đọc các trang tìm được rồi viết câu trả lời
-ai_tra_loi = pipeline(
+# Generator: reads the retrieved pages and writes the answer
+generator_model = pipeline(
     "text-generation",
     model="Qwen/Qwen2.5-0.5B-Instruct",
     device_map="auto",
     torch_dtype="auto",
 )
 
-print(
-    "✅ AI đã sẵn sàng! Thiết bị:",
-    "GPU 🚀" if torch.cuda.is_available() else "CPU (sẽ hơi chậm)",
-)
+print("AI ready! Device:", "GPU" if torch.cuda.is_available() else "CPU (will be slower)")
+
+# PART 2 - CORE RAG LOGIC
+# DOCUMENT_STORE holds everything the assistant "remembers". The three
+# lists always stay the same length and order: content[i] is the text of
+# page i, and file_name[i] / page_number[i] are its source.
+DOCUMENT_STORE = {"content": [], "file_name": [], "page_number": [], "embeddings": None}
+
+MAX_CHARS_PER_PAGE = 1000     # truncate very long pages so inference stays fast
+MIN_CHARS_PER_PAGE = 30       # pages shorter than this are treated as blank
+RELEVANCE_THRESHOLD = 0.30    # below this score, a page is considered unrelated
+MENTION_THRESHOLD = 0.45      # at/above this score, a document clearly mentions the topic
 
 
-# ============================================================
-# PHẦN 2 — BỘ NÃO CỦA TRỢ LÝ NHIỀU PDF
-# ============================================================
-# KHO = trí nhớ của trợ lý. 4 danh sách có cùng độ dài, cùng thứ tự:
-#   noi_dung[i] là chữ của trang thứ i, ten_file[i] và so_trang[i] là nguồn của nó.
-KHO = {"noi_dung": [], "ten_file": [], "so_trang": [], "embedding": None}
-
-MAX_KY_TU_MOI_TRANG = 1000   # cắt bớt trang quá dài cho AI chạy nhanh
-TOI_THIEU_KY_TU = 30         # trang ít hơn ngần này coi như trang trống
-NGUONG_LIEN_QUAN = 0.30      # dưới mức này coi như trang không liên quan
-NGUONG_DE_CAP = 0.45         # từ mức này coi như tài liệu có đề cập rõ
-
-
-def doc_1_pdf(duong_dan):
-    """Đọc 1 file PDF -> (tên file, [(số trang, chữ), ...], thông báo lỗi)."""
-    ten = os.path.basename(str(duong_dan))
-    cac_trang = []
+def read_pdf(file_path):
+    """Read one PDF -> (file_name, [(page_number, text), ...], error_message)."""
+    file_name = os.path.basename(str(file_path))
+    pages = []
     try:
-        pdf = PdfReader(duong_dan)
-        if pdf.is_encrypted:                 # TÌNH HUỐNG: PDF khoá mật khẩu
+        pdf = PdfReader(file_path)
+        if pdf.is_encrypted:                     # handle password-protected PDFs
             try:
                 pdf.decrypt("")
             except Exception:
-                return ten, [], "PDF bị khoá mật khẩu"
-        for i, trang in enumerate(pdf.pages):
-            chu = (trang.extract_text() or "").strip()
-            chu = re.sub(r"\n{3,}", "\n\n", chu)     # dọn dòng trống thừa
-            if len(chu) >= TOI_THIEU_KY_TU:          # bỏ trang trống / trang bìa ảnh
-                cac_trang.append((i + 1, chu))
-    except Exception as loi:                 # TÌNH HUỐNG: file hỏng, không phải PDF thật
-        return ten, [], f"Không đọc được file ({loi})"
+                return file_name, [], "PDF is password-protected"
+        for i, page in enumerate(pdf.pages):
+            text = (page.extract_text() or "").strip()
+            text = re.sub(r"\n{3,}", "\n\n", text)   # collapse excess blank lines
+            if len(text) >= MIN_CHARS_PER_PAGE:      # skip blank pages / image-only covers
+                pages.append((i + 1, text))
+    except Exception as error:                   # file is corrupted or not a real PDF
+        return file_name, [], f"Could not read file ({error})"
 
-    if not cac_trang:                        # TÌNH HUỐNG: PDF ảnh quét, không có lớp chữ
-        return ten, [], "Không có lớp chữ (có thể là ảnh quét) → cần OCR"
-    return ten, cac_trang, ""
+    if not pages:                                # scanned PDF with no text layer
+        return file_name, [], "No text layer found (likely a scanned image) -> needs OCR"
+    return file_name, pages, ""
 
 
-def xu_ly_tai_lieu(danh_sach_file):
-    """Nạp tất cả PDF vào KHO và tạo embedding cho từng trang."""
-    global KHO
-    KHO = {"noi_dung": [], "ten_file": [], "so_trang": [], "embedding": None}
+def process_documents(file_list):
+    """Load all uploaded PDFs into DOCUMENT_STORE and embed every page."""
+    global DOCUMENT_STORE
+    DOCUMENT_STORE = {"content": [], "file_name": [], "page_number": [], "embeddings": None}
 
-    if not danh_sach_file:                   # TÌNH HUỐNG: chưa chọn file nào
-        return "Hãy chọn 2–3 file PDF rồi bấm lại.", []
+    if not file_list:
+        return "Please select 2-3 PDF files and try again.", []
 
-    bang = []
-    for duong_dan in danh_sach_file:
-        ten = os.path.basename(str(duong_dan))
-        if not ten.lower().endswith(".pdf"):  # TÌNH HUỐNG: không phải file PDF
-            bang.append([ten, 0, "❌ Không phải file PDF"])
+    status_rows = []
+    for file_path in file_list:
+        file_name = os.path.basename(str(file_path))
+        if not file_name.lower().endswith(".pdf"):
+            status_rows.append([file_name, 0, "Not a PDF file"])
             continue
 
-        ten, cac_trang, loi = doc_1_pdf(duong_dan)
-        if loi:
-            bang.append([ten, 0, "❌ " + loi])
+        file_name, pages, error = read_pdf(file_path)
+        if error:
+            status_rows.append([file_name, 0, error])
             continue
 
-        for so, chu in cac_trang:            # ghi nhớ trang KÈM nguồn của nó
-            KHO["noi_dung"].append(chu[:MAX_KY_TU_MOI_TRANG])
-            KHO["ten_file"].append(ten)
-            KHO["so_trang"].append(so)
-        bang.append([ten, len(cac_trang), "✅ Đã nạp"])
+        for page_number, text in pages:          # remember each page with its source
+            DOCUMENT_STORE["content"].append(text[:MAX_CHARS_PER_PAGE])
+            DOCUMENT_STORE["file_name"].append(file_name)
+            DOCUMENT_STORE["page_number"].append(page_number)
+        status_rows.append([file_name, len(pages), "Loaded"])
 
-    if not KHO["noi_dung"]:
-        return "Không đọc được chữ nào trên file đã tải lên", bang
+    if not DOCUMENT_STORE["content"]:
+        return "Could not extract any text from the uploaded files.", status_rows
 
-    # Biến toàn bộ trang của MỌI tài liệu thành embedding trong cùng một "bản đồ ý nghĩa"
-    KHO["embedding"] = ai_tim_kiem.encode(
-        KHO["noi_dung"], convert_to_tensor=True, show_progress_bar=False
+    # Embed every page from every document into the same "meaning space"
+    DOCUMENT_STORE["embeddings"] = retriever_model.encode(
+        DOCUMENT_STORE["content"], convert_to_tensor=True, show_progress_bar=False
     )
-    so_tai_lieu = len(set(KHO["ten_file"]))
+    num_documents = len(set(DOCUMENT_STORE["file_name"]))
     return (
-        f"✅ Đã nạp **{len(KHO['noi_dung'])} trang** từ **{so_tai_lieu} tài liệu**. Em có thể đặt câu hỏi.",
-        bang,
+        f"Loaded {len(DOCUMENT_STORE['content'])} pages from {num_documents} document(s). "
+        f"You can ask a question now.",
+        status_rows,
     )
 
 
-def muc_do_de_cap(diem):
-    """Đổi điểm tương đồng thành nhãn dễ hiểu cho học sinh."""
-    if diem >= NGUONG_DE_CAP:
-        return "🟢 Có đề cập rõ"
-    if diem >= NGUONG_LIEN_QUAN:
-        return "🟡 Có liên quan"
-    return "⚪ Không đề cập"
+def mention_level(score):
+    """Turn a similarity score into a human-readable label."""
+    if score >= MENTION_THRESHOLD:
+        return "Clearly mentioned"
+    if score >= RELEVANCE_THRESHOLD:
+        return "Somewhat related"
+    return "Not mentioned"
 
 
-def tra_loi(cau_hoi, top_k, do_dai):
-    """Truy xuất trang liên quan trong nhiều PDF rồi để AI viết câu trả lời."""
-    if KHO["embedding"] is None:             # chưa xử lý tài liệu
-        return "⚠️ Chưa có tài liệu. Hãy tải PDF và bấm **Xử lý tài liệu** trước.", [], []
-    if not cau_hoi or not cau_hoi.strip():   # câu hỏi rỗng
-        return "⚠️ Em chưa nhập câu hỏi.", [], []
+def answer_question(question, top_k, answer_length):
+    """Retrieve relevant pages across documents, then let the AI write an answer."""
+    if DOCUMENT_STORE["embeddings"] is None:
+        return "No documents loaded yet. Upload PDFs and click **Process documents** first.", [], []
+    if not question or not question.strip():
+        return "Please enter a question.", [], []
 
-    cau_hoi = cau_hoi.strip()
+    question = question.strip()
     top_k = int(top_k)
 
-    # Biến câu hỏi thành embedding rồi so với TẤT CẢ các trang
-    emb_hoi = ai_tim_kiem.encode(cau_hoi, convert_to_tensor=True)
-    diem = util.cos_sim(emb_hoi, KHO["embedding"])[0].cpu().tolist()
+    # Embed the question and compare it against every page
+    question_embedding = retriever_model.encode(question, convert_to_tensor=True)
+    scores = util.cos_sim(question_embedding, DOCUMENT_STORE["embeddings"])[0].cpu().tolist()
 
-    # Với mỗi tài liệu, tìm trang giống câu hỏi nhất -> bảng "nguồn nào đề cập"
-    tot_nhat = {}
-    for i, d in enumerate(diem):
-        ten = KHO["ten_file"][i]
-        if ten not in tot_nhat or d > tot_nhat[ten][1]:
-            tot_nhat[ten] = (i, d)
-    xep_hang = sorted(tot_nhat.items(), key=lambda x: -x[1][1])
-    bang_de_cap = [
-        [ten, KHO["so_trang"][i], round(d, 3), muc_do_de_cap(d)] for ten, (i, d) in xep_hang
+    # Best-scoring page per document -> "which source mentions this?" table
+    best_per_doc = {}
+    for i, score in enumerate(scores):
+        file_name = DOCUMENT_STORE["file_name"][i]
+        if file_name not in best_per_doc or score > best_per_doc[file_name][1]:
+            best_per_doc[file_name] = (i, score)
+    ranked = sorted(best_per_doc.items(), key=lambda x: -x[1][1])
+    mention_table = [
+        [name, DOCUMENT_STORE["page_number"][i], round(score, 3), mention_level(score)]
+        for name, (i, score) in ranked
     ]
 
-    # Chọn trang đưa cho AI: ưu tiên MỖI TÀI LIỆU một trang tốt nhất
-    #    (để câu trả lời không bị nghiêng hết về một nguồn), rồi mới lấp đầy bằng top toàn cục.
-    chon = []
-    for ten, (i, d) in xep_hang:
-        if d >= NGUONG_LIEN_QUAN and len(chon) < top_k:
-            chon.append(i)
-    thu_tu_toan_cuc = sorted(range(len(diem)), key=lambda i: -diem[i])
-    for i in thu_tu_toan_cuc:
-        if len(chon) >= top_k:
+    # Select pages for context: one best page per document first (so the
+    # answer isn't skewed toward a single source), then fill remaining
+    # slots with the globally top-scoring pages.
+    selected = []
+    for name, (i, score) in ranked:
+        if score >= RELEVANCE_THRESHOLD and len(selected) < top_k:
+            selected.append(i)
+    global_order = sorted(range(len(scores)), key=lambda i: -scores[i])
+    for i in global_order:
+        if len(selected) >= top_k:
             break
-        if i not in chon and diem[i] >= NGUONG_LIEN_QUAN:
-            chon.append(i)
-    if not chon:                             # TÌNH HUỐNG: câu hỏi ngoài tài liệu
-        chon = thu_tu_toan_cuc[:1]           # vẫn đưa 1 trang để AI tự nói "chưa tìm thấy"
-    chon.sort(key=lambda i: -diem[i])
+        if i not in selected and scores[i] >= RELEVANCE_THRESHOLD:
+            selected.append(i)
+    if not selected:                             # question is outside the documents
+        selected = global_order[:1]              # still give 1 page so the AI can say "not found"
+    selected.sort(key=lambda i: -scores[i])
 
-    # Gom nội dung các trang đã chọn, mỗi trang dán nhãn nguồn rõ ràng
-    tai_lieu = ""
-    bang_nguon = []
-    for i in chon:
-        tai_lieu += f"\n[Nguồn: {KHO['ten_file'][i]} — Trang {KHO['so_trang'][i]}]\n{KHO['noi_dung'][i]}\n"
-        bang_nguon.append([KHO["ten_file"][i], KHO["so_trang"][i], round(diem[i], 3)])
+    # Build the context text, labeling each page with its source
+    context_text = ""
+    source_table = []
+    for i in selected:
+        context_text += (
+            f"\n[Source: {DOCUMENT_STORE['file_name'][i]} - Page {DOCUMENT_STORE['page_number'][i]}]\n"
+            f"{DOCUMENT_STORE['content'][i]}\n"
+        )
+        source_table.append(
+            [DOCUMENT_STORE["file_name"][i], DOCUMENT_STORE["page_number"][i], round(scores[i], 3)]
+        )
 
-    # Soạn "lời dặn": hộp quy tắc (system) + hộp dữ liệu (user)
-    loi_dan = [
+    # System prompt enforces answering only from the retrieved context,
+    # citing file name + page number, and admitting when info is missing.
+    messages = [
         {
             "role": "system",
-            "content": "Bạn là trợ lý đọc nhiều tài liệu. CHỈ trả lời dựa vào phần TÀI LIỆU bên dưới. "
-                       "Trả lời bằng tiếng Việt, ngắn gọn. Luôn nêu rõ TÊN TÀI LIỆU và SỐ TRANG cho mỗi ý. "
-                       "Nếu nhiều tài liệu cùng nói về vấn đề đó, hãy liệt kê đủ các nguồn và chỉ ra điểm giống/khác nhau. "
-                       "Nếu tài liệu không có thông tin, hãy trả lời đúng câu: "
-                       "'Tôi chưa tìm thấy thông tin này trong tài liệu.'",
+            "content": "You are an assistant that reads multiple documents. Answer ONLY using the "
+                       "DOCUMENTS section below. Be concise. Always cite the FILE NAME and PAGE NUMBER "
+                       "for each point. If several documents cover the topic, list all of them and note "
+                       "similarities/differences. If the documents don't contain the answer, reply exactly: "
+                       "'I could not find this information in the documents.'",
         },
-        {"role": "user", "content": f"TÀI LIỆU:\n{tai_lieu}\n\nCÂU HỎI: {cau_hoi}"},
+        {"role": "user", "content": f"DOCUMENTS:\n{context_text}\n\nQUESTION: {question}"},
     ]
 
-    # AI đọc và viết câu trả lời
     try:
-        ket_qua = ai_tra_loi(loi_dan, max_new_tokens=int(do_dai), do_sample=False)
-        dau_ra = ket_qua[0]["generated_text"]
-        cau_tra_loi = dau_ra[-1]["content"] if isinstance(dau_ra, list) else str(dau_ra)
-    except Exception as loi:
-        return f"❌ Lỗi khi tạo câu trả lời: {loi}", bang_nguon, bang_de_cap
+        result = generator_model(messages, max_new_tokens=int(answer_length), do_sample=False)
+        output = result[0]["generated_text"]
+        answer_text = output[-1]["content"] if isinstance(output, list) else str(output)
+    except Exception as error:
+        return f"Error while generating the answer: {error}", source_table, mention_table
 
-    # Ghép câu trả lời với danh sách nguồn để đối chiếu với PDF gốc
-    danh_sach = "\n".join(
-        f"- {ten} — trang {so} (độ tương đồng {d})" for ten, so, d in bang_nguon
+    source_list = "\n".join(
+        f"- {name} - page {page} (similarity {score})" for name, page, score in source_table
     )
-    ket = f"### 🤖 Câu trả lời\n{cau_tra_loi.strip()}\n\n### 📄 Các trang đã dùng\n{danh_sach}"
-    return ket, bang_nguon, bang_de_cap
+    final_answer = f"### Answer\n{answer_text.strip()}\n\n### Pages used\n{source_list}"
+    return final_answer, source_table, mention_table
 
 
-# ============================================================
-# PHẦN 3 — GIAO DIỆN GRADIO
-# ============================================================
-def xay_giao_dien():
-    with gr.Blocks(title="Trợ lý nhiều PDF", theme=gr.themes.Soft()) as app:
+# PART 3 - GRADIO INTERFACE
+def build_interface():
+    with gr.Blocks(title="Multi-PDF Assistant", theme=gr.themes.Soft()) as app:
         gr.Markdown(
-            "# 📚 Trợ lý nhiều PDF\n"
-            "Tải lên **2–3 tài liệu PDF cùng chủ đề** → đặt câu hỏi → trợ lý trả lời "
-            "và chỉ rõ **nguồn nào, trang nào** đề cập vấn đề đó."
+            "# 📚 Multi-PDF Assistant\n"
+            "Upload **2-3 PDF documents on the same topic**, ask a question, and the assistant "
+            "will answer while stating **which source and page** covers it."
         )
 
         with gr.Row():
-            # ----- Cột trái: kho tài liệu -----
             with gr.Column(scale=1):
-                gr.Markdown("### 1️⃣ Kho tài liệu")
-                o_file = gr.File(
-                    label="Chọn 2–3 file PDF (loại bôi đen được chữ)",
+                gr.Markdown("### 1️⃣ Document store")
+                file_input = gr.File(
+                    label="Select 2-3 PDF files (with selectable text)",
                     file_count="multiple",
                     file_types=[".pdf"],
                     type="filepath",
                 )
-                nut_xu_ly = gr.Button("📥 Xử lý tài liệu", variant="primary")
-                o_trang_thai = gr.Markdown()
-                bang_tai_lieu = gr.Dataframe(
-                    headers=["Tài liệu", "Số trang có chữ", "Trạng thái"],
-                    label="Kết quả nạp tài liệu",
+                process_button = gr.Button("📥 Process documents", variant="primary")
+                status_output = gr.Markdown()
+                documents_table = gr.Dataframe(
+                    headers=["Document", "Pages with text", "Status"],
+                    label="Loading results",
                     interactive=False,
                     wrap=True,
                 )
 
-            # ----- Cột phải: hỏi đáp -----
             with gr.Column(scale=2):
-                gr.Markdown("### 2️⃣ Đặt câu hỏi")
-                o_cau_hoi = gr.Textbox(
-                    label="Câu hỏi",
-                    placeholder="Ví dụ: Nguồn nào đề cập đến cách xử lý khi bị lộ mật khẩu?",
+                gr.Markdown("### 2️⃣ Ask a question")
+                question_input = gr.Textbox(
+                    label="Question",
+                    placeholder="E.g. Which source explains what to do if a password is leaked?",
                     lines=2,
                 )
                 with gr.Row():
-                    o_topk = gr.Slider(1, 8, value=4, step=1, label="Số trang truy xuất (top_k)")
-                    o_dodai = gr.Slider(50, 400, value=180, step=10, label="Độ dài câu trả lời (tokens)")
-                nut_hoi = gr.Button("🤖 Hỏi trợ lý", variant="primary")
+                    topk_slider = gr.Slider(1, 8, value=4, step=1, label="Pages to retrieve (top_k)")
+                    length_slider = gr.Slider(50, 400, value=180, step=10, label="Answer length (tokens)")
+                ask_button = gr.Button("🤖 Ask", variant="primary")
 
-                o_tra_loi = gr.Markdown()
-                bang_de_cap = gr.Dataframe(
-                    headers=["Tài liệu", "Trang liên quan nhất", "Độ tương đồng", "Mức độ đề cập"],
-                    label="🔎 Nguồn nào đề cập vấn đề này?",
+                answer_output = gr.Markdown()
+                mention_table_output = gr.Dataframe(
+                    headers=["Document", "Most relevant page", "Similarity", "Mention level"],
+                    label="🔎 Which source mentions this?",
                     interactive=False,
                     wrap=True,
                 )
-                bang_nguon = gr.Dataframe(
-                    headers=["Tài liệu", "Trang", "Độ tương đồng"],
-                    label="📄 Các trang AI đã đọc để trả lời",
+                source_table_output = gr.Dataframe(
+                    headers=["Document", "Page", "Similarity"],
+                    label="📄 Pages the AI read to answer",
                     interactive=False,
                     wrap=True,
                 )
 
         gr.Markdown(
-            "💡 *Mẹo kiểm thử:* thử hỏi một điều **không có** trong tài liệu — trợ lý phải nói "
-            "\"Tôi chưa tìm thấy thông tin này trong tài liệu.\" chứ không được bịa."
+            "💡 *Testing tip:* ask something **not** in the documents — the assistant should "
+            "reply \"I could not find this information in the documents.\" instead of making it up."
         )
 
-        # Nối nút bấm với hàm xử lý
-        nut_xu_ly.click(fn=xu_ly_tai_lieu, inputs=[o_file], outputs=[o_trang_thai, bang_tai_lieu])
-        nut_hoi.click(
-            fn=tra_loi,
-            inputs=[o_cau_hoi, o_topk, o_dodai],
-            outputs=[o_tra_loi, bang_nguon, bang_de_cap],
+        process_button.click(fn=process_documents, inputs=[file_input], outputs=[status_output, documents_table])
+        ask_button.click(
+            fn=answer_question,
+            inputs=[question_input, topk_slider, length_slider],
+            outputs=[answer_output, source_table_output, mention_table_output],
         )
-        o_cau_hoi.submit(
-            fn=tra_loi,
-            inputs=[o_cau_hoi, o_topk, o_dodai],
-            outputs=[o_tra_loi, bang_nguon, bang_de_cap],
+        question_input.submit(
+            fn=answer_question,
+            inputs=[question_input, topk_slider, length_slider],
+            outputs=[answer_output, source_table_output, mention_table_output],
         )
 
     return app
 
 
 if __name__ == "__main__":
-    demo = xay_giao_dien()
+    demo = build_interface()
     demo.launch(share=False, debug=False)
+
