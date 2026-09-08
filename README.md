@@ -1,4 +1,4 @@
-# 📚 Multi-PDF Assistant (RAG + Gradio) (Best for Vietnamese Users)
+# 📚 Multi-PDF Assistant (RAG + Gradio) 
 
 Upload 2–3 PDF documents **on the same topic**, ask a question, and the
 assistant will:
