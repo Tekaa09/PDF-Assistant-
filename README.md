@@ -23,9 +23,9 @@ no paid API required.
 
 Every PDF page is stored together with its **file name** and **page
 number**, so the assistant always states which document and page a piece
-of information came from — and replies *"I couldn't find this
-information in the documents."* when a question falls outside the
-uploaded documents, instead of making things up.
+of information came from. In case that a question falls outside the
+uploaded documents, the assistant replies *"I couldn't find this
+information in the documents, instead of making things up.
 
 ## 🚀 Getting started
 
